@@ -1,0 +1,281 @@
+---
+title: "OSO_Smolt_L_W"
+author: "Scott Akenhead, Braden Judson"
+date: " `r Sys.Date()` "
+date-format: "YYYY-MM-DD"
+format:
+  pdf:
+    documentclass: article
+    toc: true
+execute: 
+  cache: false
+editor: visual
+---
+
+```{r setup}
+#| echo: false
+#| include: false
+library(tidyr); library(magrittr); library(knitr)
+
+# local functions
+Simple<-function(d, do.print=T){
+    Simp=function(x){  # this function is inside Simple()
+        x1=x[!is.na(x)]
+        n <- length(x1); m <- mean(x1); sd <- sd(x1); se = sd/sqrt(n); cv= sd/m;
+        y= quantile(x1)
+         ma=mad(x1);
+        a=c( prettyNum(format="fg",  n, digits=1),
+             prettyNum(format="fg",  m, digits=3),
+             prettyNum(format="fg", sd, digits=3),
+             prettyNum(format="fg", se, digits=3),
+             prettyNum(format="fg", cv, digits=3),
+             prettyNum(format="fg", y[3],digits=3),
+             prettyNum(format="fg", ma,  digits=3),
+             prettyNum(format="fg", y[1],digits=3),
+             prettyNum(format="fg", y[2],digits=3),
+             prettyNum(format="fg", y[4],digits=3),
+             prettyNum(format="fg", y[5],digits=3))
+        return(a)
+    }
+    sts=c("n","m","s","se","cv","med", "mad", "min", "q1","q3","max")
+    if(is.null(dim(d))) {  # is d one-dimensional?
+        z=noquote(Simp(d)) # returns a character string suitable for printing
+        names(z) = sts
+        if(do.print) print(z)
+        invisible(as.numeric(z))
+    } else {
+        z=noquote(apply(d, 2, Simp))
+        rownames(z)=sts
+        if(do.print) print(z)
+        z=matrix(as.numeric(z),ncol=dim(d)[2])
+        dimnames(z)=list(stats=sts, vars=colnames(d))
+        invisible(z)
+    }
+}
+
+```
+
+#Dataset \## Source
+
+For smolts in river, 2006-16, 2018, 2019, 2021; 14 years; 26,230 observations.
+
+establish provenance of data, reference to method.\
+datasets used in analysis need to be in Zenodo or eq. for paper to be accepted.
+
+## import and summarize
+
+### overall summary
+
+```{r readcsv}
+a = read.csv('data/OSO_smolts_tidy.csv')
+cat(colnames(a),'\n')
+a$condition= 1e5*a$weight_g * a$FL_mm^(-3)
+Simple(a[, c('FL_mm', 'weight_g','condition')])
+```
+
+### summaries by year
+
+```{r}
+year_simple = by(a[, c('FL_mm', 'weight_g','condition')], a$year,Simple, do.print=F)
+year=c(2006:2016,2018, 2019,2021)  # missing 2017, 2020
+k = year-2005
+year_med_mad=data.frame(year=2006:2021,L_med=NA,L_mad=NA,W_med=NA,W_mad=NA,C_med=NA,C_mad=NA)
+for(j in 1:14) year_med_mad[ k[j],2:7]= year_simple[[j]][c(6,7, 17,18,28,29)]
+# leaves 2 rows, 2017 and 2020, as NA.
+print(year_med_mad)
+```
+
+## PDDs
+
+### Length
+
+First, probability density distribution (PDD) of lengths (mm), all years combined.
+
+```{r allDensityL}
+Simple(a$FL_mm)
+ggplot(data=a, aes(FL_mm)) + theme_bw()+
+    geom_histogram(stat = "density", colour="wheat2")  
+# breaks=seq(70,120,2.5),
+```
+
+### Weight
+
+Second, PDD of weights
+
+```{r allDensityW}
+#| warning: false
+Simple(a$weight_g)
+ggplot(data=a, aes(weight_g)) + theme_bw()+
+    geom_histogram(stat = "density",colour="wheat2")
+```
+
+## Condition
+
+time series of smolt condition, regardless of age.
+
+```{r tsC}
+#| warning: false
+ggplot(year_med_mad, aes(x=year, y=C_med)) + theme_bw() +
+    geom_point() + geom_line() +labs(x='Smolt Year', y='Condition')
+```
+
+# Fitting Ages to Lengths
+
+fitting two normals to density distributions of length by year.
+
+```{r G2}
+GaussTwice = function (params,dat ){
+    prop1  = params[1]
+    mean1  = params[2]
+    stdev1 = params[3]
+    mean2  = params[4]
+    stdev2 = params[5]
+    bins    = dat[,1] # data as columns
+    density = dat[,2]
+    # dat is vector bins, vector density
+    # sum (density) is 1, so two proportions, prop2 = 1-prop 1
+    # prop1 bounded 0 to 1.
+    # BUT predicted density range exceeds observed range,
+    # so sum(d_hat) < 1. So correct to sum to 1.
+    d_hat = prop1  * dnorm(bins, mean1, stdev1) +
+         (1-prop1) * dnorm(bins, mean2, stdev2)
+    d_hat = d_hat * 1.0/sum(d_hat) # correct for truncated prob. density dists.  
+    ssq = sum ( (density - d_hat)^2) 
+    return(ssq)
+}
+GaussOnce = function (params,dat ){
+    mean1  = params[2]
+    stdev1 = params[3]
+    bins    = dat[,1] # data as columns
+    density = dat[,2]
+    # dat is vector bins, vector density
+    # BUT predicted density range exceeds observed range,
+    # so sum(d_hat) < 1. So correct to sum to 1.
+    d_hat = dnorm(bins, mean1, stdev1) 
+    d_hat = d_hat * 1.0/sum(d_hat) # correct for truncated prob. density dists.  
+    ssq = sum ( (density - d_hat)^2) 
+    return(ssq)
+}
+
+Stats_SSQ_Hessian = function (fit1, nobs){
+    denom = nobs-length(fit1$par) 
+    sigma2_reg= fit1$value / denom
+    sigma_params = sqrt(sigma2_reg*diag(solve(fit1$hessian)) )
+    x <- c(stdev_reg=sqrt(sigma2_reg), sigma_params )
+    return(x)
+}
+```
+
+## Length Distribution
+
+Typical raw data from manual collection:too many observations at a multiple of 10, alternation of frequency at even and odd values,. Alternative is collection by digital images, automated extraction of lengths.
+
+```{r prep_G2}
+L1= by(a$FL_mm, a$year, hist, breaks=c(72:115), plot=FALSE)
+# can't get this to recognize freq=F or probability=T. output varies.
+# so might have to calc. density as  n[i] /sum(n)
+bins= L1[[1]][[4]] # 72.5  73.5  74.5 ...114.5 114.5 (n=43)
+nbins=length(bins)
+#
+L_dens= as.data.frame(matrix(nrow=14, ncol=nbins)) 
+for (j in 1:14)  L_dens[j,]= L1[[ j ]][[2]]
+print('observations per year')
+print(rowSums(L_dens))
+
+# smooth with 3-point running mean of history.
+# x[t] = 1/3 * (x[t-2] + x[t-1] + x[t]) 
+# remove spikes at 90, 100,; pits 89 91, 99 101,;
+# this makes first two bins NA
+# but the last bin is the mean of last three bins, 
+# so the midpoint is the last minus 1 (preceding)
+for (j in 1:14) L_dens[j,]=filter(unlist(L_dens[j,]), rep(1.0/3.0,3),method="convolution",sides=1)
+L_dens= L_dens[,-c(1,2)] # remove columns that are NA
+bins  = bins[-c(1, nbins)] # drop first, slide left by one
+nbins = nbins-2
+
+# convert from frequency to density.
+for (j in 1:14)  L_dens[j,] = L_dens[j,]  * (1.0/sum(L_dens[j,]))
+matplot(bins, t(L_dens),  type='l', lty=1, 
+        xlab="Fork Length (mm)", ylab="Probability Density")
+```
+
+## guess and fit
+
+The fit is via R function optim(), minimizing SSQ (sum of squared deviations) via steepest-decent search (quasi-Newton) within supplied bounds for the parameter estimates (algorithm L-BFGS-B; Byrd *et. al.* 1995, Nocedal and Wright 1999).
+
+Byrd, R. H., Lu, P., Nocedal, J. and Zhu, C. (1995). A limited memory algorithm for bound constrained optimization. SIAM Journal on Scientific Computing 16: 1190-1208. [doi:10.1137/0916069](https://doi.org/10.1137/0916069).
+
+Nocedal, J. and Wright, S. J. (1999). Numerical Optimization. Springer.
+
+From the minimized SSQ, the standard errors of the regression and of the parameters was calculated as $$
+ \sigma^2_{\text{reg}}= SSQ/(n-p)
+ $$ $$
+\sigma_{\text{par}}  = (\sigma^2_{\text{reg}} ~ \text{diag} (\mathcal{H}^{-1}))^{1/2} 
+$$ where *n* is the count of bins in the density distribution, *p* is the count of parameters fitted, and $\mathcal{H}$ is the Hessian matrix, the curvatures in the SSQ surface at its minimum.
+
+```{r opt}
+fitAll=data.frame(year, prop1=NA, mean1=NA, stdev1=NA, mean2=NA, stdev2=NA, stdev_reg=NA, prop1_SD=NA,mean1_SD=NA,stdev1_SD=NA,mean2_SD=NA,stdev2_SD=NA)
+for (j in 1:14){
+    density= unlist(L_dens[j,]) 
+    dat= data.frame(bins, density)  # data in columns
+    params = c(prop1=0.5, mean1=82, stdev1=7.5, mean2=100, stdev2=7.5 )
+    # test1 = GaussTwice(params, dat)
+    fit1 = optim(params, GaussTwice,method="L-BFGS-B", hessian=T, 
+       lower=c(0,72, 3, 100, 3), upper=c(1, 95, 8, 120, 8),
+       dat=dat)
+    if (identical(fit1$convergence,0L)){   # integer zero
+        x = Stats_SSQ_Hessian(fit1, 43) 
+        cat('\nYear',year[j], ' stdev_reg. =', round(x[1],4),  '\n')
+        cat('parameters', names(x[-1]),       '\n') # drop first one
+        cat('estimates ', round(fit1$par,3), '\n')
+        cat('stdev     ', round(x[-1],3),   '\n\n')
+        fitAll[j,2:12] = c(fit1$par, x)
+    }   else {
+        cat('\nYear',year[j], 'did not converge \n')  
+    }  
+}
+```
+
+```{r tbl_fits}
+kable(fitAll[, 1:6],digits=c(0,2,1,1,1,1) )
+```
+
+## Plot Fit to Length PDD by Year
+
+### gather predicted and observed
+
+```{r fits_L_Y}
+#fitAll[14,]
+# year   prop1  mean1 stdev1 mean2 stdev2
+# 2021 0.76462 92.914 4.5128 91.68 1.8052
+# stdev_reg prop1_SD mean1_SD stdev1_SD mean2_SD stdev2_SD
+# 0.016557   0.19346   0.6544   0.71084  0.43318   0.72995
+for(j in 1:14){
+    gauss1 =     fitAll[j,2] * dnorm(bins, fitAll[j,3],fitAll[j,4])
+    gauss2 = (1-fitAll[j,2]) * dnorm(bins, fitAll[j,5],fitAll[j,6])
+    gauss = gauss1 + gauss2 
+    truncation = 1.0/sum(gauss)
+    gauss1 = gauss1 * truncation
+    gauss2 = gauss2 * truncation
+    gauss = gauss * truncation
+    density =  unlist(L_dens[j,])
+# plot(bins,gauss1,type="l", ylim=c(0,.14));
+# lines(bins,gauss2);lines(bins,gauss);lines(bins,density)
+    x = data.frame(year=year[j], bins, observed=density, predicted=gauss, age1=gauss1, age2=gauss2)
+    if(j == 1) {x1 = x} else {x1 = rbind(x,x1)} 
+}
+```
+
+Plots for each year
+
+```{r plt_L_Y}
+#| warning: false
+# colnames(economics_long) date variable value value01
+# ggplot(economics_long, aes(date,value01,colour=variable))+geom_line()
+# colnames(x1)colnames(x1) year bins observed predicted age1  age2 
+# colnames(x2) year bins name Density
+x2 =pivot_longer(x1,cols=c("observed","predicted","age1","age2"),cols_vary = "slowest", values_to="Density")
+ggplot(x2, aes(x=bins, y=Density, colour=name)) + theme_bw()+
+    geom_line() + facet_wrap("year")
+
+```
